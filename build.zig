@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     triangle_exe.linkSystemLibrary("glfw");
 
     const example_registry = b.option([]const u8, "example-registry", "Override the path to the Vulkan registry used for the examples") orelse "examples/vk.xml";
-    const gen = VkGenerateStep.create(b, example_registry);
+    const gen = VkGenerateStep.create(b, .{ .path = example_registry });
     triangle_exe.root_module.addImport("vulkan", gen.getModule());
 
     const vk_zig_install_step = b.addInstallFile(gen.getSource(), "src/vk.zig");

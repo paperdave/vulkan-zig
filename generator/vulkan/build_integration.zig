@@ -10,7 +10,7 @@ pub const GenerateStep = struct {
     step: Build.Step,
     generated_file: Build.GeneratedFile,
     /// The path to vk.xml
-    spec_path: []const u8,
+    spec_path: Build.LazyPath,
     /// The API to generate for.
     /// Defaults to Vulkan.
     // Note: VulkanSC is experimental.
@@ -19,7 +19,7 @@ pub const GenerateStep = struct {
     /// Initialize a Vulkan generation step, for `builder`. `spec_path` is the path to
     /// vk.xml, relative to the project root. The generated bindings will be placed at
     /// `out_path`, which is relative to the zig-cache directory.
-    pub fn create(builder: *Build, spec_path: []const u8) *GenerateStep {
+    pub fn create(builder: *Build, spec_path: Build.LazyPath) *GenerateStep {
         const self = builder.allocator.create(GenerateStep) catch unreachable;
         self.* = .{
             .step = Build.Step.init(.{
@@ -33,6 +33,7 @@ pub const GenerateStep = struct {
             },
             .spec_path = spec_path,
         };
+        spec_path.addStepDependencies(&self.step);
         return self;
     }
 
@@ -80,7 +81,7 @@ pub const GenerateStep = struct {
         var man = b.graph.cache.obtain();
         defer man.deinit();
 
-        const spec = try cwd.readFileAlloc(b.allocator, self.spec_path, std.math.maxInt(usize));
+        const spec = try cwd.readFileAlloc(b.allocator, self.spec_path.getPath(b), std.math.maxInt(usize));
         // TODO: Look into whether this is the right way to be doing
         // this - maybe the file-level caching API has some benefits I
         // don't understand.
