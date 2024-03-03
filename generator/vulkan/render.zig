@@ -1183,6 +1183,16 @@ fn Renderer(comptime WriterType: type) type {
                 \\pub fn {0s}Wrapper(comptime cmds: {0s}CommandFlags) type {{
                 \\    return struct {{
                 \\        dispatch: Dispatch,
+            , .{name});
+            if (dispatch_type != .base) {
+                try self.writer.print(
+                    \\        {0s}: {1s},
+                    \\
+                ,
+                    .{ @tagName(dispatch_type), name },
+                );
+            }
+            try self.writer.print(
                 \\
                 \\        const Self = @This();
                 \\        pub const commands = cmds;
@@ -1242,7 +1252,7 @@ fn Renderer(comptime WriterType: type) type {
                 // alias like `const old = new;`. This ensures that Vulkan bindings generated
                 // for newer versions of vulkan can still invoke extension behavior on older
                 // implementations.
-                try self.renderWrapper(decl.name, command);
+                try self.renderWrapper(dispatch_type, decl.name, command);
             }
 
             try self.writer.writeAll("};}\n");
@@ -1261,11 +1271,17 @@ fn Renderer(comptime WriterType: type) type {
                 .device => "device",
             };
 
+            const assign = switch (dispatch_type) {
+                .base => "",
+                inline .instance, .device => |t| "self." ++ @tagName(t) ++ " = " ++ @tagName(t) ++ ";",
+            };
+
             @setEvalBranchQuota(2000);
 
             try self.writer.print(
                 \\pub fn load({[params]s}) error{{CommandLoadFailure}}!Self {{
                 \\    var self: Self = undefined;
+                \\    {[assign]s}
                 \\    inline for (std.meta.fields(Dispatch)) |field| {{
                 \\        const name: [*:0]const u8 = @ptrCast(field.name ++ "\x00");
                 \\        const cmd_ptr = loader({[first_arg]s}, name) orelse return error.CommandLoadFailure;
@@ -1275,6 +1291,7 @@ fn Renderer(comptime WriterType: type) type {
                 \\}}
                 \\pub fn loadNoFail({[params]s}) Self {{
                 \\    var self: Self = undefined;
+                \\    {[assign]s}
                 \\    inline for (std.meta.fields(Dispatch)) |field| {{
                 \\        const name: [*:0]const u8 = @ptrCast(field.name ++ "\x00");
                 \\        const cmd_ptr = loader({[first_arg]s}, name) orelse undefined;
@@ -1282,7 +1299,11 @@ fn Renderer(comptime WriterType: type) type {
                 \\    }}
                 \\    return self;
                 \\}}
-            , .{ .params = params, .first_arg = loader_first_arg });
+            , .{
+                .params = params,
+                .first_arg = loader_first_arg,
+                .assign = assign,
+            });
         }
 
         fn derefName(name: []const u8) []const u8 {
@@ -1293,12 +1314,23 @@ fn Renderer(comptime WriterType: type) type {
                 name;
         }
 
-        fn renderWrapperPrototype(self: *Self, name: []const u8, command: reg.Command, returns: []const ReturnValue) !void {
+        fn renderWrapperPrototype(self: *Self, dispatch_type: CommandDispatchType, name: []const u8, command: reg.Command, returns: []const ReturnValue) !void {
             try self.writer.writeAll("pub fn ");
             try self.writeIdentifierWithCase(.camel, trimVkNamespace(name));
             try self.writer.writeAll("(self: Self, ");
 
-            for (command.params) |param| {
+            const params = switch (dispatch_type) {
+                .base => command.params,
+                inline .instance, .device => |t| if (eqlIgnoreCase(
+                    // TODO: base this on the type not the name.
+                    command.params[0].name,
+                    @tagName(t),
+                ))
+                    command.params[1..]
+                else
+                    command.params,
+            };
+            for (params) |param| {
                 // This parameter is returned instead.
                 if ((try self.classifyParam(param)) == .out_pointer) {
                     continue;
@@ -1327,12 +1359,12 @@ fn Renderer(comptime WriterType: type) type {
             }
         }
 
-        fn renderWrapperCall(self: *Self, name: []const u8, command: reg.Command, returns: []const ReturnValue) !void {
+        fn renderWrapperCall(self: *Self, dispatch_type: CommandDispatchType, name: []const u8, command: reg.Command, returns: []const ReturnValue) !void {
             try self.writer.writeAll("self.dispatch.");
             try self.writeIdentifier(name);
             try self.writer.writeAll("(");
 
-            for (command.params) |param| {
+            for (command.params, 0..) |param, i| {
                 switch (try self.classifyParam(param)) {
                     .out_pointer => {
                         try self.writer.writeByte('&');
@@ -1342,6 +1374,9 @@ fn Renderer(comptime WriterType: type) type {
                         try self.writeIdentifierWithCase(.snake, derefName(param.name));
                     },
                     .bitflags, .in_pointer, .in_out_pointer, .buffer_len, .mut_buffer_len, .other => {
+                        if (i == 0 and dispatch_type != .base and eqlIgnoreCase(param.name, @tagName(dispatch_type))) {
+                            try self.writer.writeAll("self.");
+                        }
                         try self.writeIdentifierWithCase(.snake, param.name);
                     },
                 }
@@ -1414,7 +1449,7 @@ fn Renderer(comptime WriterType: type) type {
             try self.writer.writeAll("};\n");
         }
 
-        fn renderWrapper(self: *Self, name: []const u8, command: reg.Command) !void {
+        fn renderWrapper(self: *Self, dispatch_type: CommandDispatchType, name: []const u8, command: reg.Command) !void {
             const returns_vk_result = command.return_type.* == .name and mem.eql(u8, command.return_type.name, "VkResult");
             const returns_void = command.return_type.* == .name and mem.eql(u8, command.return_type.name, "void");
 
@@ -1432,21 +1467,21 @@ fn Renderer(comptime WriterType: type) type {
                 try self.writer.writeAll(";\n");
             }
 
-            try self.renderWrapperPrototype(name, command, returns);
+            try self.renderWrapperPrototype(dispatch_type, name, command, returns);
 
             if (returns.len == 1 and returns[0].origin == .inner_return_value) {
                 try self.writer.writeAll("{\n\n");
 
                 if (returns_vk_result) {
                     try self.writer.writeAll("const result = ");
-                    try self.renderWrapperCall(name, command, returns);
+                    try self.renderWrapperCall(dispatch_type, name, command, returns);
                     try self.writer.writeAll(";\n");
 
                     try self.renderErrorSwitch("result", command);
                     try self.writer.writeAll("return result;\n");
                 } else {
                     try self.writer.writeAll("return ");
-                    try self.renderWrapperCall(name, command, returns);
+                    try self.renderWrapperCall(dispatch_type, name, command, returns);
                     try self.writer.writeAll(";\n");
                 }
 
@@ -1469,7 +1504,7 @@ fn Renderer(comptime WriterType: type) type {
 
             if (returns_vk_result) {
                 try self.writer.writeAll("const result = ");
-                try self.renderWrapperCall(name, command, returns);
+                try self.renderWrapperCall(dispatch_type, name, command, returns);
                 try self.writer.writeAll(";\n");
 
                 try self.renderErrorSwitch("result", command);
@@ -1480,7 +1515,7 @@ fn Renderer(comptime WriterType: type) type {
                 if (!returns_void) {
                     try self.writer.writeAll("return_values.return_value = ");
                 }
-                try self.renderWrapperCall(name, command, returns);
+                try self.renderWrapperCall(dispatch_type, name, command, returns);
                 try self.writer.writeAll(";\n");
             }
 
